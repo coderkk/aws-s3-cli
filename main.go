@@ -1,12 +1,13 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"os"
-	"path/filepath"
+	"path"
+	"strconv"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -178,6 +179,8 @@ func PutObjects(ctx *cli.Context) {
 		bucket_name = os.Getenv("AWS_DEFAULT_BUCKET")
 	}
 
+	var upload_loop bool = ctx.Bool("loop")
+
 	var filesPath string = ctx.String("path")
 	if !utils.IsDirExists(filesPath) {
 		currentPath, err = utils.GetExecutePath()
@@ -199,7 +202,18 @@ func PutObjects(ctx *cli.Context) {
 	}
 
 	log.Printf("Start upload to %s\n", filesPath)
-	err = uploadFiles(bucket_name, "", filesPath)
+	if upload_loop {
+		cnt := 0
+		for {
+			err = uploadLoopFiles(bucket_name, filesPath, cnt)
+			if err != nil {
+				log.Fatalf("Failed to upload files to %s/%s, %s\n", bucket_name, filesPath, err.Error())
+			}
+			cnt++
+		}
+	} else {
+		err = uploadFiles(bucket_name, filesPath)
+	}
 	if err != nil {
 		log.Fatalf("Failed to upload file from %s to bucket %s, %s\n", filesPath, bucket_name, err.Error())
 		return
@@ -207,18 +221,21 @@ func PutObjects(ctx *cli.Context) {
 	log.Printf("Successfully uploaded file to bucket %s\n", bucket_name)
 }
 
-func uploadFile(bucket_name string, key string, file string) error {
-	buff, err := utils.CreateReadStream(file)
+func uploadFile(bucket_name string, key string, filename string) error {
+	var osFile *os.File
+	var err error
+
+	osFile, err = os.Open(filename)
 	if err != nil {
-		fmt.Println("Failed to open a file.", err)
-		os.Exit(1)
+		return fmt.Errorf("failed to open file %q, %v", filename, err)
 	}
+	defer osFile.Close()
 
 	// Upload a new object "testobject" with the string "Hello World!" to our "newbucket".
 	input := &s3.PutObjectInput{
 		Bucket: aws.String(bucket_name),
 		Key:    aws.String(key),
-		Body:   bytes.NewReader(buff),
+		Body:   osFile,
 	}
 
 	uploader := manager.NewUploader(s3Client)
@@ -227,27 +244,63 @@ func uploadFile(bucket_name string, key string, file string) error {
 	return err
 }
 
-func uploadFiles(bucket_name string, key string, filesPath string) error {
-	var err error
+func uploadFiles(bucket_name string, filesPath string) error {
 	var uploadErr error = nil
-	err = filepath.Walk(filesPath, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		log.Printf("File %s\n", path)
-		if info.IsDir() {
-			if path != filesPath {
-				uploadErr = uploadFiles(bucket_name, "", path)
-			}
+	var filePath string = ""
+
+	files, err := ioutil.ReadDir(filesPath)
+	if err != nil {
+		return err
+	}
+
+	for _, file := range files {
+		filePath = path.Join(filesPath, file.Name())
+		if file.IsDir() {
+			uploadErr = uploadFiles(bucket_name, filePath)
 		} else {
-			uploadErr = uploadFile(bucket_name, path, path)
+			uploadErr = uploadFile(bucket_name, filePath, filePath)
 			if uploadErr == nil {
-				log.Printf("Successfully uploaded file (%s) to bucket %s\n", path, bucket_name)
+				log.Printf("Successfully uploaded file (%s) to bucket %s\n", filePath, bucket_name)
+			} else {
+				log.Printf("Failed to upload file (%s) to bucket %s, %s\n", filePath, bucket_name, uploadErr.Error())
+				return uploadErr
 			}
 		}
-		return nil
-	})
-	return err
+	}
+
+	return uploadErr
+}
+
+func uploadLoopFiles(bucket_name string, filesPath string, cnt int) error {
+	var uploadErr error = nil
+	var filePath string = ""
+	var key string = ""
+
+	files, err := ioutil.ReadDir(filesPath)
+	if err != nil {
+		return err
+	}
+
+	for _, file := range files {
+		filePath = path.Join(filesPath, file.Name())
+		if file.IsDir() {
+			uploadErr = uploadLoopFiles(bucket_name, filePath, cnt)
+		} else {
+			key = filePath
+			if cnt > 0 {
+				key = key + "_" + strconv.Itoa(cnt)
+			}
+			uploadErr = uploadFile(bucket_name, key, filePath)
+			if uploadErr == nil {
+				log.Printf("Successfully uploaded file (%s) to bucket %s\n", key, bucket_name)
+			} else {
+				log.Printf("Failed to upload file (%s) to bucket %s, %s\n", key, bucket_name, uploadErr.Error())
+				return uploadErr
+			}
+		}
+	}
+
+	return uploadErr
 }
 
 func GetObject(ctx *cli.Context) {
@@ -399,6 +452,10 @@ func main() {
 					&cli.StringFlag{
 						Name:  "bucket",
 						Usage: "name of the bucket",
+					},
+					&cli.BoolFlag{
+						Name:  "loop",
+						Usage: "Loop through files in the directory",
 					},
 				},
 				Action: func(c *cli.Context) error {
