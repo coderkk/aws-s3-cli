@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io/ioutil"
@@ -9,12 +10,14 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3Types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
@@ -23,7 +26,45 @@ import (
 	"github.com/poseidon-network/mineral-cli/internal/utils"
 )
 
+const (
+	PART_SIZE = 6_000_000
+	RETRIES   = 2
+)
+
 var s3Client *s3.Client
+
+type CustomReader struct {
+	fp   *os.File
+	size int64
+	read int64
+}
+
+func (r *CustomReader) Read(p []byte) (int, error) {
+	return r.fp.Read(p)
+}
+
+func (r *CustomReader) ReadAt(p []byte, off int64) (int, error) {
+	n, err := r.fp.ReadAt(p, off)
+	if err != nil {
+		return n, err
+	}
+
+	// Got the length have read( or means has uploaded), and you can construct your message
+	atomic.AddInt64(&r.read, int64(n))
+
+	// I have no idea why the read length need to be div 2,
+	// maybe the request read once when Sign and actually send call ReadAt again
+	// It works for me
+	// log.Printf("total read:%d    progress:%d%%\n", r.read/2, int(float64(r.read*100/2)/float64(r.size)))
+	clearCurrentLine()
+	fmt.Printf("total read:%d    progress:%d%%", r.read, int((float64(r.read)/float64(r.size))*100))
+
+	return n, err
+}
+
+func (r *CustomReader) Seek(offset int64, whence int) (int64, error) {
+	return r.fp.Seek(offset, whence)
+}
 
 func EstablishConnection() {
 	var cfg aws.Config
@@ -54,6 +95,13 @@ func EstablishConnection() {
 
 	// Create an Amazon S3 service client
 	s3Client = s3.NewFromConfig(cfg)
+}
+
+func clearCurrentLine() {
+	fmt.Print("\033[G\033[K")
+}
+func moveCursorUp() {
+	fmt.Print("\033[A")
 }
 
 func GetBucketList(ctx *cli.Context) {
@@ -221,8 +269,108 @@ func PutObjects(ctx *cli.Context) {
 	log.Printf("Successfully uploaded file to bucket %s\n", bucket_name)
 }
 
+func Upload(bucket_name string, key string, resp *s3.CreateMultipartUploadOutput, fileBytes []byte, partNum int) (completedPart s3Types.CompletedPart, err error) {
+	var try int
+	for try <= RETRIES {
+		uploadResp, err := s3Client.UploadPart(context.TODO(), &s3.UploadPartInput{
+			Body:          bytes.NewReader(fileBytes),
+			Bucket:        aws.String(bucket_name),
+			Key:           aws.String(key),
+			PartNumber:    int32(partNum),
+			UploadId:      resp.UploadId,
+			ContentLength: int64(len(fileBytes)),
+		})
+		if err != nil {
+			fmt.Println(err)
+			if try == RETRIES {
+				return s3Types.CompletedPart{}, err
+			} else {
+				try++
+			}
+		} else {
+			return s3Types.CompletedPart{
+				ETag:       uploadResp.ETag,
+				PartNumber: int32(partNum),
+			}, nil
+		}
+	}
+	return s3Types.CompletedPart{}, nil
+}
+
+func _uploadFile(bucket_name string, key string, filename string) (err error) {
+	// open file
+	file, _ := os.Open(filename)
+	defer file.Close()
+
+	// Get file size
+	stats, _ := file.Stat()
+	fileSize := stats.Size()
+
+	// put file in byteArray
+	buffer := make([]byte, fileSize) // wouldn't want to do this for a large file because it would store a potentially super large file into memory
+	file.Read(buffer)
+
+	// start multipart upload
+	createdResp, err := s3Client.CreateMultipartUpload(context.TODO(), &s3.CreateMultipartUploadInput{
+		Bucket: aws.String(bucket_name),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("Upload ID: %d", createdResp.UploadId)
+
+	var start, currentSize int
+	var remaining = int(fileSize)
+	var partNum = 1
+	var completedParts []s3Types.CompletedPart
+
+	for start = 0; remaining != 0; start += PART_SIZE {
+		if remaining < PART_SIZE {
+			currentSize = remaining
+		} else {
+			currentSize = PART_SIZE
+		}
+
+		completed, err := Upload(bucket_name, key, createdResp, buffer[start:start+currentSize], partNum)
+		if err != nil {
+			_, err = s3Client.AbortMultipartUpload(context.TODO(), &s3.AbortMultipartUploadInput{
+				Bucket:   createdResp.Bucket,
+				Key:      createdResp.Key,
+				UploadId: createdResp.UploadId,
+			})
+			if err != nil {
+				log.Fatal(err)
+			}
+		}
+		remaining -= currentSize
+		fmt.Printf("Part %v complete, %v bytes remaining\n", partNum, remaining)
+		completedParts = append(completedParts, completed)
+		partNum++
+	}
+
+	// complete multipart upload
+	input := &s3.CompleteMultipartUploadInput{
+		Bucket:   createdResp.Bucket,
+		Key:      createdResp.Key,
+		UploadId: createdResp.UploadId,
+		MultipartUpload: &s3Types.CompletedMultipartUpload{
+			Parts: completedParts,
+		},
+	}
+	_, err = s3Client.CompleteMultipartUpload(context.TODO(), input)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Println("Completed upload")
+	// log.Println(result)
+	return nil
+}
+
 func uploadFile(bucket_name string, key string, filename string) error {
 	var osFile *os.File
+	var fileInfo os.FileInfo
+	var reader *CustomReader
 	var err error
 
 	osFile, err = os.Open(filename)
@@ -231,15 +379,28 @@ func uploadFile(bucket_name string, key string, filename string) error {
 	}
 	defer osFile.Close()
 
+	fileInfo, err = osFile.Stat()
+	if err != nil {
+		return err
+	}
+
+	reader = &CustomReader{
+		fp:   osFile,
+		size: fileInfo.Size(),
+	}
 	// Upload a new object "testobject" with the string "Hello World!" to our "newbucket".
 	input := &s3.PutObjectInput{
 		Bucket: aws.String(bucket_name),
 		Key:    aws.String(key),
-		Body:   osFile,
+		Body:   reader,
 	}
 
-	uploader := manager.NewUploader(s3Client)
+	uploader := manager.NewUploader(s3Client, func(u *manager.Uploader) {
+		u.PartSize = 10 * 1024 * 1024 // The minimum/default allowed part size is 5MB
+		u.Concurrency = 10            // default is 5
+	})
 	_, err = uploader.Upload(context.TODO(), input)
+	fmt.Printf("\n")
 
 	return err
 }
